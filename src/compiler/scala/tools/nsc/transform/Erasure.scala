@@ -70,9 +70,8 @@ abstract class Erasure extends InfoTransform
   }
 
   override protected def verifyJavaErasure = settings.Xverify || settings.debug
-  def needsJavaSig(tp: Type, throwsArgs: List[Type]) = !settings.Ynogenericsig && {
-    // scala/bug#10351: don't emit a signature if tp erases to a primitive
-    def needs(tp: Type) = NeedsSigCollector.collect(tp) && !erasure(tp.typeSymbol)(tp).typeSymbol.isPrimitiveValueClass
+  private def needsJavaSig(tp: Type, throwsArgs: List[Type]) = !settings.Ynogenericsig && {
+    def needs(tp: Type) = NeedsSigCollector.collect(tp)
     needs(tp) || throwsArgs.exists(needs)
   }
 
@@ -87,31 +86,6 @@ abstract class Erasure extends InfoTransform
       (initialSymbol.isMethod && initialSymbol.typeParams.contains(sym))
     )
   )
-
-  // Ensure every '.' in the generated signature immediately follows
-  // a close angle bracket '>'.  Any which do not are replaced with '$'.
-  // This arises due to multiply nested classes in the face of the
-  // rewriting explained at rebindInnerClass.   This should be done in a
-  // more rigorous way up front rather than catching it after the fact,
-  // but that will be more involved.
-  private def dotCleanup(sig: String): String = {
-    // OPT 50% of time in generic signatures (~1% of compile time) was in this method, hence the imperative rewrite.
-    var last: Char = '\u0000'
-    var i = 0
-    val len = sig.length
-    val copy: Array[Char] = sig.toCharArray
-    var changed = false
-    while (i < len) {
-      val ch = copy(i)
-      if (ch == '.' && last != '>') {
-         copy(i) = '$'
-         changed = true
-      }
-      last = ch
-      i += 1
-    }
-    if (changed) new String(copy) else sig
-  }
 
   /** This object is only used for sanity testing when -check:genjvm is set.
    *  In that case we make sure that the erasure of the `normalized` type
@@ -215,10 +189,14 @@ abstract class Erasure extends InfoTransform
   /** The Java signature of type 'info', for symbol sym. The symbol is used to give the right return
    *  type for constructors.
    */
-  def javaSig(sym0: Symbol, info: Type, markClassUsed: Symbol => Unit): Option[String] = enteringErasure {
+
+  final def javaSig(sym0: Symbol, info: Type, markClassUsed: Symbol => Unit): Option[String] = enteringErasure { javaSig0(sym0, info, markClassUsed) }
+  @noinline
+  private final def javaSig0(sym0: Symbol, info: Type, markClassUsed: Symbol => Unit): Option[String] = {
+    val builder = new java.lang.StringBuilder(64)
     val isTraitSignature = sym0.enclClass.isTrait
 
-    def superSig(cls: Symbol, parents: List[Type]) = {
+    def superSig(cls: Symbol, parents: List[Type]): Unit = {
       def isInterfaceOrTrait(sym: Symbol) = sym.isInterface || sym.isTrait
 
       // a signature should always start with a class
@@ -236,30 +214,39 @@ abstract class Erasure extends InfoTransform
         else minParents
 
       val ps = ensureClassAsFirstParent(validParents)
-
-      (ps map boxedSig).mkString
+      ps.foreach(boxedSig)
     }
-    def boxedSig(tp: Type) = jsig(tp, primitiveOK = false)
-    def boundsSig(bounds: List[Type]) = {
+    def boxedSig(tp: Type): Unit = jsig(tp, primitiveOK = false)
+    def boundsSig(bounds: List[Type]): Unit = {
       val (isTrait, isClass) = bounds partition (_.typeSymbol.isTrait)
-      val classPart = isClass match {
-        case Nil    => ":" // + boxedSig(ObjectTpe)
-        case x :: _ => ":" + boxedSig(x)
+      isClass match {
+        case Nil    => builder.append(':') // + boxedSig(ObjectTpe)
+        case x :: _ => builder.append(':'); boxedSig(x)
       }
-      classPart :: (isTrait map boxedSig) mkString ":"
+      isTrait.foreach { tp =>
+        builder.append(':')
+        boxedSig(tp)
+      }
     }
-    def paramSig(tsym: Symbol) = tsym.name + boundsSig(hiBounds(tsym.info.bounds))
-    def polyParamSig(tparams: List[Symbol]) = (
-      if (tparams.isEmpty) ""
-      else tparams map paramSig mkString ("<", "", ">")
+    def paramSig(tsym: Symbol): Unit = {
+      builder.append(tsym.name)
+      boundsSig(hiBounds(tsym.info.bounds))
+    }
+    def polyParamSig(tparams: List[Symbol]): Unit = (
+      if (!tparams.isEmpty) {
+        builder.append('<')
+        tparams foreach paramSig
+        builder.append('>')
+      }
     )
 
     // Anything which could conceivably be a module (i.e. isn't known to be
     // a type parameter or similar) must go through here or the signature is
     // likely to end up with Foo<T>.Empty where it needs Foo<T>.Empty$.
-    def fullNameInSig(sym: Symbol) = "L" + enteringJVM(sym.javaBinaryNameString)
+    def fullNameInSig(sym: Symbol): Unit = builder.append('L').append(enteringJVM(sym.javaBinaryNameString))
 
-    def jsig(tp0: Type, existentiallyBound: List[Symbol] = Nil, toplevel: Boolean = false, primitiveOK: Boolean = true): String = {
+    @noinline
+    def jsig(tp0: Type, existentiallyBound: List[Symbol] = Nil, toplevel: Boolean = false, primitiveOK: Boolean = true): Unit = {
       val tp = tp0.dealias
       tp match {
         case st: SubType =>
@@ -267,51 +254,67 @@ abstract class Erasure extends InfoTransform
         case ExistentialType(tparams, tpe) =>
           jsig(tpe, tparams, toplevel, primitiveOK)
         case TypeRef(pre, sym, args) =>
-          def argSig(tp: Type) =
+          def argSig(tp: Type): Unit =
             if (existentiallyBound contains tp.typeSymbol) {
               val bounds = tp.typeSymbol.info.bounds
-              if (!(AnyRefTpe <:< bounds.hi)) "+" + boxedSig(bounds.hi)
-              else if (!(bounds.lo <:< NullTpe)) "-" + boxedSig(bounds.lo)
-              else "*"
+              if (!(AnyRefTpe <:< bounds.hi)) {
+                builder.append('+')
+                boxedSig(bounds.hi)
+              }
+              else if (!(bounds.lo <:< NullTpe)) {
+                builder.append('-')
+                boxedSig(bounds.lo)
+              }
+              else builder.append('*')
             } else tp match {
               case PolyType(_, res) =>
-                "*" // scala/bug#7932
+                builder.append('*') // scala/bug#7932
               case _ =>
                 boxedSig(tp)
             }
-          def classSig = {
+          def classSig: Unit = {
             markClassUsed(sym)
             val preRebound = pre.baseType(sym.owner) // #2585
-            val sigCls = {
-              if (needsJavaSig(preRebound, Nil)) {
-                val s = jsig(preRebound, existentiallyBound)
-                if (s.charAt(0) == 'L') {
-                  val withoutSemi = s.substring(0, s.length - 1)
-                  // If the prefix is a module, drop the '$'. Classes (or modules) nested in modules
-                  // are separated by a single '$' in the filename: `object o { object i }` is o$i$.
-                  val withoutOwningModuleDollar =
-                    if (preRebound.typeSymbol.isModuleClass) withoutSemi.stripSuffix(nme.MODULE_SUFFIX_STRING)
-                    else withoutSemi
-                  withoutOwningModuleDollar + "." + sym.javaSimpleName
-                } else fullNameInSig(sym)
-              }
-              else fullNameInSig(sym)
+            if (needsJavaSig(preRebound, Nil)) {
+              val i = builder.length()
+              jsig(preRebound, existentiallyBound)
+              if (builder.charAt(i) == 'L') {
+                builder.delete(builder.length() - 1, builder.length())// delete ';'
+                // If the prefix is a module, drop the '$'. Classes (or modules) nested in modules
+                // are separated by a single '$' in the filename: `object o { object i }` is o$i$.
+                if (preRebound.typeSymbol.isModuleClass)
+                  builder.delete(builder.length() - 1, builder.length())
+
+                // Ensure every '.' in the generated signature immediately follows
+                // a close angle bracket '>'.  Any which do not are replaced with '$'.
+                // This arises due to multiply nested classes in the face of the
+                // rewriting explained at rebindInnerClass.
+
+                // TODO revisit this. Does it align with javac for code that can be expressed in both languages?
+                val delimiter = if (builder.charAt(builder.length() - 1) == '>') '.' else '$'
+                builder.append(delimiter).append(sym.javaSimpleName)
+              } else fullNameInSig(sym)
+            } else fullNameInSig(sym)
+
+            if (!args.isEmpty) {
+              builder.append('<')
+              args foreach argSig
+              builder.append('>')
             }
-            val sigArgs = {
-              if (args.isEmpty) ""
-              else "<"+(args map argSig).mkString+">"
-            }
-            dotCleanup(sigCls + sigArgs + ";")
+            builder.append(';')
           }
 
           // If args isEmpty, Array is being used as a type constructor
           if (sym == ArrayClass && args.nonEmpty) {
             if (unboundedGenericArrayLevel(tp) == 1) jsig(ObjectTpe)
-            else ARRAY_TAG.toString+(args map (jsig(_))).mkString
+            else {
+              builder.append(ARRAY_TAG)
+              args.foreach(jsig(_))
+            }
           }
           else if (isTypeParameterInSig(sym, sym0)) {
             assert(!sym.isAliasType, "Unexpected alias type: " + sym)
-            "" + TVAR_TAG + sym.name + ";"
+            builder.append(TVAR_TAG).append(sym.name).append(';')
           }
           else if (sym == AnyClass || sym == AnyValClass || sym == SingletonClass)
             jsig(ObjectTpe)
@@ -324,7 +327,7 @@ abstract class Erasure extends InfoTransform
           else if (isPrimitiveValueClass(sym)) {
             if (!primitiveOK) jsig(ObjectTpe)
             else if (sym == UnitClass) jsig(BoxedUnitTpe)
-            else abbrvTag(sym).toString
+            else builder.append(abbrvTag(sym))
           }
           else if (sym.isDerivedValueClass) {
             val unboxed     = sym.derivedValueClassUnbox.tpe_*.finalResultType
@@ -343,11 +346,11 @@ abstract class Erasure extends InfoTransform
             jsig(erasure(sym0)(tp), existentiallyBound, toplevel, primitiveOK)
         case PolyType(tparams, restpe) =>
           assert(tparams.nonEmpty)
-          val poly = if (toplevel) polyParamSig(tparams) else ""
-          poly + jsig(restpe)
+          if (toplevel) polyParamSig(tparams)
+          jsig(restpe)
 
         case MethodType(params, restpe) =>
-          val buf = new StringBuffer("(")
+          builder.append('(')
           params foreach (p => {
             val tp = p.attachments.get[TypeParamVarargsAttachment] match {
               case Some(att) =>
@@ -355,14 +358,13 @@ abstract class Erasure extends InfoTransform
                 // instead of Array[T], as the latter would erase to Object (instead of Array[Object]).
                 // To make the generic signature correct ("[T", not "[Object"), an attachment on the
                 // parameter symbol stores the type T that was replaced by Object.
-                buf.append("["); att.typeParamRef
+                builder.append('['); att.typeParamRef
               case _         => p.tpe
             }
-            buf append jsig(tp)
+            jsig(tp)
           })
-          buf append ")"
-          buf append (if (restpe.typeSymbol == UnitClass || sym0.isConstructor) VOID_TAG.toString else jsig(restpe))
-          buf.toString
+          builder.append(')')
+          if (restpe.typeSymbol == UnitClass || sym0.isConstructor) builder.append(VOID_TAG) else jsig(restpe)
 
         case RefinedType(parents, decls) =>
           jsig(intersectionDominator(parents), primitiveOK = primitiveOK)
@@ -381,7 +383,14 @@ abstract class Erasure extends InfoTransform
     }
     val throwsArgs = sym0.annotations flatMap ThrownException.unapply
     if (needsJavaSig(info, throwsArgs)) {
-      try Some(jsig(info, toplevel = true) + throwsArgs.map("^" + jsig(_, toplevel = true)).mkString(""))
+      try {
+        jsig(info, toplevel = true)
+        throwsArgs.foreach { t =>
+          builder.append('^')
+          jsig(t, toplevel = true)
+        }
+        Some(builder.toString)
+      }
       catch { case ex: UnknownSig => None }
     }
     else None
@@ -389,48 +398,32 @@ abstract class Erasure extends InfoTransform
 
   class UnknownSig extends Exception
 
-  // TODO: move to constructors?
-  object mixinTransformer extends Transformer {
-    /** Add calls to supermixin constructors
-      *    `super[mix].$init$()`
-      *  to tree, which is assumed to be the body of a constructor of class clazz.
-      */
-    private def addMixinConstructorCalls(tree: Tree, clazz: Symbol): Tree = {
-      def mixinConstructorCalls: List[Tree] = {
-        for (mc <- clazz.mixinClasses.reverse if mc.isTrait && mc.primaryConstructor != NoSymbol)
-          yield atPos(tree.pos) {
-            Apply(SuperSelect(clazz, mc.primaryConstructor), Nil)
-          }
-      }
-
-      tree match {
-        case Block(Nil, expr) =>
-          // AnyVal constructor - have to provide a real body so the
-          // jvm doesn't throw a VerifyError. But we can't add the
-          // body until now, because the typer knows that Any has no
-          // constructor and won't accept a call to super.init.
-          assert((clazz isSubClass AnyValClass) || clazz.info.parents.isEmpty, clazz)
-          Block(List(Apply(gen.mkSuperInitCall, Nil)), expr)
-
-        case Block(stats, expr) =>
-          // needs `hasSymbolField` check because `supercall` could be a block (named / default args)
-          val (presuper, supercall :: rest) = stats span (t => t.hasSymbolWhich(_ hasFlag PRESUPER))
-          treeCopy.Block(tree, presuper ::: (supercall :: mixinConstructorCalls ::: rest), expr)
-      }
+  /** Add calls to supermixin constructors
+    *    `super[mix].$init$()`
+    *  to tree, which is assumed to be the body of a constructor of class clazz.
+    */
+  private def addMixinConstructorCalls(tree: Tree, clazz: Symbol): Tree = {
+    // TODO: move to constructors?
+    def mixinConstructorCalls: List[Tree] = {
+      for (mc <- clazz.mixinClasses.reverse if mc.isTrait && mc.primaryConstructor != NoSymbol)
+        yield atPos(tree.pos) {
+          Apply(SuperSelect(clazz, mc.primaryConstructor), Nil)
+        }
     }
 
-    override def transform(tree: Tree): Tree = {
-      val sym = tree.symbol
-      val tree1 = tree match {
-        case DefDef(_,_,_,_,_,_) if sym.isClassConstructor && sym.isPrimaryConstructor && sym.owner != ArrayClass =>
-          deriveDefDef(tree)(addMixinConstructorCalls(_, sym.owner)) // (3)
-        case Template(parents, self, body) =>
-          val parents1 = sym.owner.info.parents map (t => TypeTree(t) setPos tree.pos)
-          treeCopy.Template(tree, parents1, noSelfType, body)
-        case _ =>
-          tree
-      }
-      super.transform(tree1)
+    tree match {
+      case Block(Nil, expr) =>
+        // AnyVal constructor - have to provide a real body so the
+        // jvm doesn't throw a VerifyError. But we can't add the
+        // body until now, because the typer knows that Any has no
+        // constructor and won't accept a call to super.init.
+        assert((clazz isSubClass AnyValClass) || clazz.info.parents.isEmpty, clazz)
+        Block(List(Apply(gen.mkSuperInitCall, Nil)), expr)
+
+      case Block(stats, expr) =>
+        // needs `hasSymbolField` check because `supercall` could be a block (named / default args)
+        val (presuper, supercall :: rest) = stats span (t => t.hasSymbolWhich(_ hasFlag PRESUPER))
+        treeCopy.Block(tree, presuper ::: (supercall :: mixinConstructorCalls ::: rest), expr)
     }
   }
 
@@ -760,6 +753,11 @@ abstract class Erasure extends InfoTransform
     override def typed1(tree: Tree, mode: Mode, pt: Type): Tree = {
       val tree1 = try {
         tree match {
+          case DefDef(_,_,_,_,_,_) if tree.symbol.isClassConstructor && tree.symbol.isPrimaryConstructor && tree.symbol.owner != ArrayClass =>
+            super.typed1(deriveDefDef(tree)(addMixinConstructorCalls(_, tree.symbol.owner)), mode, pt) // (3)
+          case Template(parents, self, body) =>
+            val parents1 = tree.symbol.owner.info.parents map (t => TypeTree(t) setPos tree.pos)
+            super.typed1(treeCopy.Template(tree, parents1, noSelfType, body), mode, pt)
           case InjectDerivedValue(arg) =>
             (tree.attachments.get[TypeRefAttachment]: @unchecked) match {
               case Some(itype) =>
@@ -1217,13 +1215,17 @@ abstract class Erasure extends InfoTransform
         case Match(selector, cases) =>
           Match(Typed(selector, TypeTree(selector.tpe)), cases)
 
-        case Literal(ct) if ct.tag == ClazzTag
-                         && ct.typeValue.typeSymbol != definitions.UnitClass =>
-          val erased = ct.typeValue.dealiasWiden match {
-            case tr @ TypeRef(_, clazz, _) if clazz.isDerivedValueClass => scalaErasure.eraseNormalClassRef(tr)
-            case tpe => specialScalaErasure(tpe)
-          }
-          treeCopy.Literal(tree, Constant(erased))
+        case Literal(ct) =>
+          // We remove the original tree attachments in pre-easure to free up memory
+          val cleanLiteral = tree.removeAttachment[OriginalTreeAttachment]
+
+          if (ct.tag == ClazzTag && ct.typeValue.typeSymbol != definitions.UnitClass) {
+            val erased = ct.typeValue.dealiasWiden match {
+              case tr @ TypeRef(_, clazz, _) if clazz.isDerivedValueClass => scalaErasure.eraseNormalClassRef(tr)
+              case tpe => specialScalaErasure(tpe)
+            }
+            treeCopy.Literal(cleanLiteral, Constant(erased))
+          } else cleanLiteral
 
         case ClassDef(_,_,_,_) =>
           debuglog("defs of " + tree.symbol + " = " + tree.symbol.info.decls)
@@ -1280,10 +1282,7 @@ abstract class Erasure extends InfoTransform
       val tree1 = preTransformer.transform(tree)
       // log("tree after pretransform: "+tree1)
       exitingErasure {
-        val tree2 = mixinTransformer.transform(tree1)
-        // debuglog("tree after addinterfaces: \n" + tree2)
-
-        newTyper(rootContextPostTyper(unit, tree)).typed(tree2)
+        newTyper(rootContextPostTyper(unit, tree)).typed(tree1)
       }
     }
   }
